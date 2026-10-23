@@ -19,6 +19,9 @@
     "README.md",
     "LICENSE"
   ],
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.4"
+  },
   "description": "Native DSH LLM adapters for OpenAI- and Anthropic-compatible endpoints (no pi-ai).",
   "keywords": [
     "dsh",
