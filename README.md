@@ -1,43 +1,50 @@
 # dsh-llm-direct
 
-Native DSH LLM adapters for OpenAI- and Anthropic-compatible endpoints — **no pi-ai**.
+Adds your own OpenAI- and Anthropic-compatible endpoints to DeepSeek Harness.
 
-DSH's Models page writes hand-declared endpoints into the `llm-pi-ai` plugin, so every custom
-provider is served by pi-ai. This plugin registers its own `LlmAdapter` through
-`ctx.llm.registerAdapter()` — the same seam DSH's built-in DeepSeek adapter uses — and speaks
-the provider HTTP APIs itself.
+DSH's Models page writes custom providers into `llm-pi-ai`, so those requests are always
+served by pi-ai. This plugin skips that layer: it registers its own `LlmAdapter` through
+`ctx.llm.registerAdapter` and talks to the provider HTTP APIs directly. pi-ai keeps working
+untouched, so both kinds of route coexist in one profile.
 
-| endpoint key         | wire protocol             | used for                    |
-|----------------------|---------------------------|-----------------------------|
-| `openai-chat`        | OpenAI Chat Completions   | Concentrate AI, RunInfra, … |
-| `anthropic-messages` | Anthropic Messages        | Merge Gateway, …            |
+Two wire protocols are supported:
+
+| `endpoint` | Protocol | Typical target |
+|---|---|---|
+| `openai-chat` | OpenAI Chat Completions | OpenRouter, Together, vLLM, most proxies |
+| `anthropic-messages` | Anthropic Messages | Claude-compatible gateways |
 
 ## Install
 
-This is a DSH **bundle**. Install it with the plugin manager rather than editing profile
-files by hand:
-
+```bash
+# macOS
+DSH="/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh"
+"$DSH" plugin --profile desktop add https://github.com/Unnidentified/dsh-llm-direct/archive/refs/tags/v0.1.1.tar.gz
 ```
-plugin_manager  install_bundle  target: github:Unnidentified/dsh-llm-direct
+
+```powershell
+# Windows PowerShell
+$DSH = "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd"
+& $DSH plugin --profile desktop add https://github.com/Unnidentified/dsh-llm-direct/archive/refs/tags/v0.1.1.tar.gz
 ```
 
-That adds the package to the profile, registers the bundle, and mounts the `llm-direct` row.
-No `cordis.patch.yml` edit and no `node_modules` copy is needed.
+Or paste the repository URL into the app's **Install plugin** field. That path needs `git`
+on the machine, which stock Windows does not have — use the tarball URL there.
 
-pi-ai is left completely untouched, so both families of routes coexist.
+The `desktop` profile has to exist first: open the app once, quit it fully, then run the
+command. Then **restart DSH**, because plugin code loads once at startup.
 
-## Configure providers
+## Configure
 
-The bundle's patch mounts the row **without** `config`: endpoints, model ids and cache
-behaviour are deployment data, not package data. Supply them from your profile's own
-`cordis.patch.yml` with a patch that targets the row by id:
+The bundle mounts the `llm-direct` row with no config, so on its own it registers nothing.
+Add providers in your profile's `cordis.patch.yml`, targeting the row by id:
 
 ```yaml
 - id: llm-direct
   config:
     providers:
-      my-openai-route:
-        displayName: My OpenAI-compatible route
+      my-route:
+        displayName: My Route
         apiKeyEnv: MY_API_KEY
         baseURL: https://api.example.com/v1
         endpoint: openai-chat
@@ -46,83 +53,98 @@ behaviour are deployment data, not package data. Supply them from your profile's
             name: Some Model
             contextWindow: 200000
             maxTokens: 32768
-            inputModalities: [text, image]
 ```
 
-Two rules the loader enforces:
+`apiKeyEnv` names an environment variable, not the key itself. If the variable is unset,
+the route registers but fails on first call.
 
-- A targeting patch replaces `config` **wholesale** - it is never deep-merged, so restate
-  every field the row needs.
-- Do **not** also `- insert:` a row with id `llm-direct`. Two entries sharing one id make the
-  loader reject the whole plugin tree, which surfaces as *every* provider disappearing from
-  the model picker, not just these.
+Two loader rules to keep in mind:
 
-**Restart DSH** after installing or updating - plugin code is loaded once at startup.
+- A targeting patch replaces `config` wholesale. It is never deep-merged, so restate every
+  field the row needs.
+- Do not also `insert` a row with id `llm-direct`. Two rows sharing one id make the loader
+  reject the whole tree, which shows up as *every* provider vanishing from the picker, not
+  just these.
+
+### Provider fields
+
+| Field | Default | Notes |
+|---|---|---|
+| `displayName` | provider key | Label in the picker |
+| `apiKeyEnv` | required | Env var holding the key |
+| `baseURL` | required | Everything **before** the path. The adapter appends `/chat/completions` (`openai-chat`) or `/v1/messages?beta=true` (`anthropic-messages`) itself. |
+| `endpoint` | required | `openai-chat` or `anthropic-messages` |
+| `contextWindow` | `1048576` | Provider-level default |
+| `defaultMaxTokens` | `32768` | Provider-level default |
+| `defaultInput` | `[text]` | Modalities assumed when a model omits them |
+| `reasoningEfforts` | unset | Map harness level names to the provider's own strings, or `false`. **Without this, no reasoning controls appear and no effort is sent.** |
+| `reasoning` | unset | Which level is preselected, by name |
+| `cacheControl` | `none` | Anthropic only: `none`, `short`, `long` |
+| `cacheRetention` | `none` | OpenAI only: `none`, `short`, `long` |
+| `models` | `[]` | List of model entries |
+
+Each model entry takes `id` (required), `name`, `description`, `contextWindow`,
+`maxTokens`, `inputModalities`, and an optional `reasoningEfforts` map.
+
+## Reasoning
+
+The two protocols express this differently, and the adapter covers both.
+
+On `openai-chat` the level goes out as `reasoning_effort`. If your provider uses different
+strings, `reasoningEfforts` maps harness names to theirs:
+
+```yaml
+reasoningEfforts:
+  low: minimal
+  high: high
+```
+
+Anthropic has no effort string, only a thinking-token budget, so the selected level becomes
+one: 1024 / 2048 / 4096 / 8192 / 16384 / 32768 tokens. `maxTokens` is raised to sit at
+least 1024 above the budget, since the provider requires the ceiling to exceed it.
+
+Thinking is enabled on the request and reasoning deltas stream back to you. Prior reasoning
+blocks are **not** replayed on later turns — that would need signature round-tripping, which
+most Anthropic-compatible gateways do not supply.
 
 ## Images
 
-Images are resolved through the harness attachment plane (`ctx.attachments.readImageRequest`)
-and sent natively:
+Images go through the harness attachment plane and are sent natively — as
+`image_url` data URLs on OpenAI routes, as base64 source blocks on Anthropic routes.
 
-* `openai-chat` → message content parts `{type:"image_url", image_url:{url:"data:<mime>;base64,…"}}`
-* `anthropic-messages` → content blocks `{type:"image", source:{type:"base64", media_type, data}}`
+- The model has to advertise image input (`inputModalities: [text, image]`). If it does not,
+  images are projected away before sending, so a text-only model never receives one.
+- A model that *does* accept images but finds no attachment service mounted fails with
+  `UNSUPPORTED_CONTENT` rather than dropping them silently.
+- Oversized sets are trimmed oldest-first to `imageBudget` (default 20 images / 40 MB), and
+  each dropped image becomes a visible placeholder.
+- `imageTarget` (default 1568×1568, 5 MB) picks the request size the attachment provider
+  derives.
 
-Behaviour:
+## Cache behaviour
 
-* The model must advertise image input (`inputModalities: [text, image]`), or images degrade to
-  the harness `textOnlyImageText` placeholder.
-* A model that accepts images but receives no attachment service fails with
-  `UNSUPPORTED_CONTENT` rather than silently dropping them.
-* Alt text for vision is unaffected: images are sent to the model, not described by a proxy.
-* Oversized sets are trimmed oldest-first to the route budget (`imageBudget.maxImages` /
-  `.maxBytes`, default 20 / 40 MB) and each dropped occurrence becomes the harness
-  `offloadedImageText` placeholder — so a huge prompt degrades visibly instead of failing.
-* `imageTarget` (`width`/`height`/`maxBytes`, default 1568×1568 / 5 MB) selects the request
-  version the attachment provider derives.
+Both defaults are `none`, and in most cases that is right: providers cache prompt prefixes
+automatically.
 
-## Verified behaviour
+`cacheControl` adds `cache_control` markers to the system block and last tool on Anthropic
+routes. `cacheRetention` sends `prompt_cache_retention` on OpenAI routes —
+`short` = `"in_memory"`, `long` = `"24h"`. Those are the only two values some gateways
+accept; `5m`, `1h` and `30m` come back as 400.
 
-* **Merge Gateway (Anthropic branch), live** — complete turns, multi-tool calls, and correct
-  cache accounting: `step 1 inputTokens 345 / cacheRead 4608 / output 109`, with
-  `uncached + cacheRead + output == totalTokens`.
-* **Merge Gateway, image input, live** — a 900×300 PNG containing `CACHE42 ZEBRA` was read
-  back correctly by the model through this adapter.
-* **Concentrate (OpenAI branch)** — request is field-valid (`reasoning_effort`, tools, no
-  `prompt_cache_key`/`prompt_cache_retention`) and the image path was confirmed on the wire as
-  a `data:image/png;base64,…` part in a tool-result turn. The account currently answers `424`
-  ("no providers allowed"), which is an access issue, not a protocol one.
+On gateways that route one model id across several upstream providers, `cacheRetention` also
+acts as a routing control. Each upstream keeps its own cache, so an unpinned session starts
+cold wherever it lands. Only the upstream that declares `prompt_cache_retention` support
+survives the field, so sending it pins requests to that one upstream and keeps a single cache
+namespace warm across sessions. The trade-off is losing automatic failover to the others.
 
-Wire shaping was derived by probing, not from pi-ai:
+## Notes
 
-* OpenAI: `stream_options.include_usage`; `prompt_tokens_details.cached_tokens` →
-  `cacheReadTokens`, with `inputTokens = prompt_tokens − cached_tokens`.
-* Merge: the authoritative usage arrives in `message_delta` (its `message_start` frame is
-  zeroed), so both frames are read.
+- Usage accounting works on both branches. On Anthropic routes the real usage arrives in
+  `message_delta`, because `message_start` reports zeros.
+- Streaming only.
+- `stop` maps to `stop` on OpenAI routes and `stop_sequences` on Anthropic ones.
+- Files are not uploaded; a `file` block becomes a harness file handle.
 
-## Limitations
+## License
 
-* **Anthropic `thinking` is not requested**, and reasoning blocks are not replayed on
-  Anthropic routes; Anthropic thinking needs signature round-tripping that Merge's DeepSeek
-  vendor does not provide. Reasoning effort is carried on the OpenAI branch as
-  `reasoning_effort`, and `reasoning-delta` frames are surfaced if a vendor sends them.
-* **Files** are not uploaded; a `file` block becomes the harness `fileHandleText` handle.
-* **`cacheControl` defaults to `none`** — both vendors cache automatically, which the probes
-  confirmed. Set `cacheControl: short|long` to add `cache_control` markers on Anthropic routes.
-* **`cacheRetention` defaults to `none`** and applies to OpenAI routes only. `short` sends
-  `prompt_cache_retention: "in_memory"`, `long` sends `"24h"`; those are the only two values
-  Concentrate accepts (`5m`/`1h`/`30m` are rejected with 400).
-  On Concentrate this is the **routing** control as much as a TTL one. One model id is served
-  by nine providers and each keeps its **own** prompt cache, so an unpinned session starts
-  cold on whichever provider it lands on, and a later session can land somewhere else again.
-  Only `deepseek` declares `prompt_cache_retention` support, so sending the field pins the
-  request to `deepseek` — one cache namespace that stays warm across sessions. Measured on
-  the first call of three consecutive fresh sessions:
-
-  | config | first-call hit | provider |
-  |---|---|---|
-  | unpinned, no retention | 75.5% / 96.7% / 75.5% | novita (varying) |
-  | pinned + `cacheRetention: long` | 93.6% / 93.6% / 93.6% | deepseek (stable) |
-
-  Trade-off: pinning removes automatic fallback to the other eight providers if `deepseek`
-  is unhealthy, in exchange for a deterministic, long-lived cache.
-* Streaming only; `stop` maps to `stop_sequences` (Anthropic) / `stop` (OpenAI).
+MIT
